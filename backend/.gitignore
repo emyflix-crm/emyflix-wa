@@ -1,0 +1,13 @@
+# Dependências
+node_modules/
+dist/
+
+# Ambiente — NÃO commitar o .env real, só o .env.example
+.env
+# Manter: .env.example
+
+# Prisma gerado
+node_modules/.prisma/
+
+# Logs
+*.log

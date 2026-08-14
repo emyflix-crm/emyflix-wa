@@ -1,0 +1,14 @@
+# Dependências
+node_modules/
+.next/
+
+# Ambiente — NÃO commitar o .env.local real
+.env.local
+.env.production.local
+.env.development.local
+
+# Build
+out/
+
+# Logs
+*.log

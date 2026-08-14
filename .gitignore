@@ -1,0 +1,30 @@
+# Dependências
+node_modules/
+.next/
+dist/
+build/
+
+# Ambiente
+.env
+.env.local
+.env.production
+
+# Prisma
+prisma/migrations/
+
+# Logs
+*.log
+npm-debug.log*
+
+# SO
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Temporários
+*.tmp
+gen_frontend*.py
+index.html

@@ -55,7 +55,7 @@ export class PaymentsService {
           failure: `${frontendUrl}/meu-plano?status=failure`,
           pending: `${frontendUrl}/meu-plano?status=pending`,
         },
-        auto_approve: true,
+        auto_return: 'approved',
         notification_url: `${appUrl}/api/payments/webhook`,
         metadata: { userId, planId, billingCycle },
       },

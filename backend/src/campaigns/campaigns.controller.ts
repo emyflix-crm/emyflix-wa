@@ -1,5 +1,6 @@
 import { Controller, Get, Post, Body, Patch, Param, Delete, UseGuards, Query } from '@nestjs/common';
-import { CampaignsService, CreateCampaignDto, UpdateCampaignDto } from './campaigns.service';
+import { CampaignsService } from './campaigns.service';
+import { CreateCampaignDto, UpdateCampaignDto } from './dto/create-campaign.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 

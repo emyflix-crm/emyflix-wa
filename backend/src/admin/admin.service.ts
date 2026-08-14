@@ -81,7 +81,7 @@ export class AdminService {
       where: { id: userId },
       include: {
         subscriptions: { include: { plan: true }, orderBy: { createdAt: 'desc' }, take: 1 },
-        whatsAppInstances: true,
+        instances: true,
       },
     });
 

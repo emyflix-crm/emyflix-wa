@@ -103,7 +103,17 @@ export class CampaignsService {
 
     return this.prisma.campaign.findUnique({
       where: { id: campaign.id },
-      include: { campaignGroup: { orderBy: { orderIndex: 'asc' } } },
+      include: { groups: { orderBy: { orderIndex: 'asc' } } },
+    });
+  }
+
+  async update(userId: string, id: string, dto: UpdateCampaignDto) {
+    const campaign = await this.prisma.campaign.findFirst({ where: { id, userId } });
+    if (!campaign) throw new NotFoundException('Campanha não encontrada');
+    
+    return this.prisma.campaign.update({
+      where: { id },
+      data: dto as any,
     });
   }
 
@@ -115,7 +125,7 @@ export class CampaignsService {
     const [campaigns, total] = await Promise.all([
       this.prisma.campaign.findMany({
         where,
-        include: { _count: { select: { campaignGroup: true } } },
+        include: { _count: { select: { groups: true } } },
         skip,
         take: Number(limit),
         orderBy: { createdAt: 'desc' },
@@ -130,7 +140,7 @@ export class CampaignsService {
     const campaign = await this.prisma.campaign.findFirst({
       where: { id, userId },
       include: {
-        campaignGroup: {
+        groups: {
           include: { group: true },
           orderBy: { orderIndex: 'asc' },
         },

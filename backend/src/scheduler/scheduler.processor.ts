@@ -1,20 +1,13 @@
 import { Processor, Process } from '@nestjs/bull';
 import { Job } from 'bull';
 import { PrismaService } from '../prisma/prisma.service';
-// Mock import since we don't know the exact structure of whatsapp service
 import { WhatsAppService } from '../whatsapp/whatsapp.service';
-import { Logger } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bull';
-import { Queue } from 'bull';
 
 @Processor('message-queue')
 export class SchedulerProcessor {
-  private readonly logger = new Logger(SchedulerProcessor.name);
-
   constructor(
     private prisma: PrismaService,
     private whatsappService: WhatsAppService,
-    @InjectQueue('message-queue') private messageQueue: Queue,
   ) {}
 
   @Process()
@@ -24,172 +17,134 @@ export class SchedulerProcessor {
     const campaignGroup = await this.prisma.campaignGroup.findUnique({
       where: { id: campaignGroupId },
       include: {
-        campaign: {
-          include: {
-            user: {
-              include: { subscription: { include: { plan: true } } },
-            },
-          },
-        },
-        group: { include: { instance: true } },
+        campaign: true,
+        group: true,
       },
     });
 
     if (!campaignGroup) return;
 
-    const { campaign, group } = campaignGroup;
-    const user = campaign.user;
-    const instance = group.instance;
+    const campaign = (campaignGroup as any).campaign;
+    const group = (campaignGroup as any).group;
 
     const updateStatus = async (status: string, errorMessage?: string) => {
       await this.prisma.campaignGroup.update({
         where: { id: campaignGroupId },
-        data: { status, errorMessage, sentAt: status === 'SENT' ? new Date() : null },
-      });
-
-      await this.prisma.messageHistory.create({
         data: {
-          userId: user.id,
-          campaignId: campaign.id,
-          groupId: group.id,
-          status,
-          errorMessage,
+          status: status as any,
+          errorMessage: errorMessage || null,
+          sentAt: status === 'SENT' ? new Date() : null,
         },
       });
-      
-      this.checkCampaignCompletion(campaign.id);
     };
 
-    if (campaign.status !== 'ACTIVE') {
-      await updateStatus('SKIPPED', 'Campaign not active');
-      return;
-    }
-
     try {
-      const isConnected = await this.whatsappService.checkConnection(instance.instanceKey);
-      if (!isConnected) {
-        await updateStatus('FAILED', 'WhatsApp desconectado');
+      // Check campaign is active
+      if (campaign.status !== 'ACTIVE') {
+        await updateStatus('SKIPPED', 'Campanha não está ativa');
         return;
       }
-    } catch (e) {
-      await updateStatus('FAILED', 'WhatsApp desconectado');
-      return;
-    }
 
-    const sub = user.subscription;
-    if (!sub || (sub.endsAt && sub.endsAt < new Date())) {
-      await updateStatus('FAILED', 'Assinatura expirada');
-      return;
-    }
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const dailyUsage = await this.prisma.dailyUsage.findFirst({
-      where: { userId: user.id, date: today },
-    });
-    
-    if ((dailyUsage?.messagesCount || 0) >= sub.plan.maxMessagesPerDay) {
-      await updateStatus('FAILED', 'Limite diário atingido');
-      return;
-    }
-
-    if (!group.isAvailable) {
-      await updateStatus('SKIPPED', 'Grupo não disponível');
-      return;
-    }
-
-    try {
-      if (campaign.mediaType === 'TEXT') {
-        await this.whatsappService.sendTextMessage(instance.instanceKey, group.groupJid, campaign.message);
-      } else {
-        await this.whatsappService.sendMediaMessage(instance.instanceKey, group.groupJid, campaign.mediaType, campaign.mediaUrl, campaign.message);
+      // Check group is available
+      if (!group.isAvailable) {
+        await updateStatus('SKIPPED', 'Grupo não disponível');
+        return;
       }
 
-      await this.prisma.dailyUsage.upsert({
-        where: { userId_date: { userId: user.id, date: today } },
-        create: { userId: user.id, date: today, messagesCount: 1 },
-        update: { messagesCount: { increment: 1 } },
+      // Check instance status
+      const instance = await this.prisma.whatsAppInstance.findUnique({
+        where: { id: campaign.instanceId },
       });
+      if (!instance || instance.status !== 'CONNECTED') {
+        await updateStatus('FAILED', 'WhatsApp desconectado');
+        await this.createHistory(campaignGroup, 'FAILED', 'WhatsApp desconectado');
+        return;
+      }
 
+      // Check subscription
+      const subscription = await this.prisma.subscription.findFirst({
+        where: { userId: campaign.userId, status: { in: ['ACTIVE', 'TRIAL'] } },
+        include: { plan: true },
+      });
+      if (!subscription || (subscription.endsAt && subscription.endsAt < new Date())) {
+        await updateStatus('FAILED', 'Assinatura expirada');
+        await this.createHistory(campaignGroup, 'FAILED', 'Assinatura expirada');
+        return;
+      }
+
+      // Check daily limit
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const usage = await this.prisma.dailyUsage.findFirst({
+        where: { userId: campaign.userId, date: { gte: today } },
+      });
+      const currentUsage = usage?.messagesCount || 0;
+      if (currentUsage >= subscription.plan.maxMessagesPerDay) {
+        await updateStatus('FAILED', 'Limite diário de mensagens atingido');
+        await this.createHistory(campaignGroup, 'FAILED', 'Limite diário atingido');
+        return;
+      }
+
+      // Send message
+      if (campaign.mediaType === 'TEXT' || !campaign.mediaUrl) {
+        await this.whatsappService.sendMessage(instance.instanceKey, group.groupJid, campaign.message);
+      } else {
+        await this.whatsappService.sendMessage(instance.instanceKey, group.groupJid, campaign.message, campaign.mediaUrl, campaign.mediaType);
+      }
+
+      // Success
       await updateStatus('SENT');
-    } catch (error: any) {
-      this.logger.error(`Failed to send message: ${error.message}`);
+      await this.createHistory(campaignGroup, 'SENT');
+
+      // Update daily usage
+      if (usage) {
+        await this.prisma.dailyUsage.update({
+          where: { id: usage.id },
+          data: { messagesCount: { increment: 1 } },
+        });
+      } else {
+        await this.prisma.dailyUsage.create({
+          data: { userId: campaign.userId, date: today, messagesCount: 1 },
+        });
+      }
+
+    } catch (error) {
       await updateStatus('FAILED', error.message);
+      await this.createHistory(campaignGroup, 'FAILED', error.message);
     }
-  }
 
-  private async checkCampaignCompletion(campaignId: string) {
-    const campaign = await this.prisma.campaign.findUnique({
-      where: { id: campaignId },
-      include: { campaignGroups: true },
+    // Check if all groups done for this campaign
+    const allGroups = await this.prisma.campaignGroup.findMany({
+      where: { campaignId: campaign.id },
     });
+    const allDone = allGroups.every(cg => ['SENT', 'FAILED', 'SKIPPED'].includes(cg.status));
 
-    if (!campaign) return;
-
-    const allDone = campaign.campaignGroups.every(cg => ['SENT', 'FAILED', 'SKIPPED'].includes(cg.status));
-    
     if (allDone) {
       if (campaign.recurrenceType === 'ONCE') {
-        await this.prisma.campaign.update({
-          where: { id: campaignId },
-          data: { status: 'COMPLETED' },
-        });
-      } else {
-        const nextRunAt = this.calculateNextRun(campaign.recurrenceType, campaign.nextRunAt || campaign.scheduledAt);
-        await this.prisma.campaign.update({
-          where: { id: campaignId },
-          data: { nextRunAt },
-        });
-
-        // Reset and schedule again
-        const groupsData = campaign.campaignGroups.map((cg, index) => {
-          const scheduledTime = new Date(nextRunAt.getTime() + index * (campaign.intervalMinutes || 0) * 60000);
-          return {
-            campaignId: campaign.id,
-            groupId: cg.groupId,
-            status: 'PENDING',
-            scheduledAt: scheduledTime,
-          };
-        });
-
-        await this.prisma.campaignGroup.deleteMany({ where: { campaignId } });
-        
-        await this.prisma.campaignGroup.createMany({
-          data: groupsData,
-        });
-
-        const newCampaignGroups = await this.prisma.campaignGroup.findMany({
-          where: { campaignId },
-        });
-
-        const now = new Date();
-        for (const cg of newCampaignGroups) {
-          let delay = new Date(cg.scheduledAt).getTime() - now.getTime();
-          if (delay < 0) delay = 0;
-          
-          const job = await this.messageQueue.add(
-            { campaignGroupId: cg.id },
-            { delay }
-          );
-
-          await this.prisma.campaignGroup.update({
-            where: { id: cg.id },
-            data: { jobId: job.id.toString() },
-          });
-        }
+        await this.prisma.campaign.update({ where: { id: campaign.id }, data: { status: 'COMPLETED' as any } });
       }
     }
   }
 
-  private calculateNextRun(recurrenceType: string, scheduledAt: Date): Date {
-    const next = new Date(scheduledAt);
-    if (recurrenceType === 'DAILY') {
-      next.setDate(next.getDate() + 1);
-    } else if (recurrenceType === 'WEEKLY') {
-      next.setDate(next.getDate() + 7);
-    } else if (recurrenceType === 'MONTHLY') {
-      next.setMonth(next.getMonth() + 1);
+  private async createHistory(campaignGroup: any, status: string, errorMessage?: string) {
+    const campaign = campaignGroup.campaign;
+    const group = campaignGroup.group;
+    try {
+      await this.prisma.messageHistory.create({
+        data: {
+          userId: campaign.userId,
+          campaignId: campaign.id,
+          campaignGroupId: campaignGroup.id,
+          instanceId: campaign.instanceId,
+          groupId: group?.id,
+          groupName: group?.name,
+          status: status as any,
+          errorMessage: errorMessage || null,
+          sentAt: new Date(),
+        },
+      });
+    } catch (e) {
+      console.error('Error creating message history:', e);
     }
-    return next;
   }
 }

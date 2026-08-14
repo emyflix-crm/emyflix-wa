@@ -1,256 +1,178 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
-
-export class CreateCampaignDto {
-  name: string;
-  message: string;
-  mediaType: string;
-  mediaUrl?: string;
-  groupIds: string[];
-  scheduledAt: Date;
-  intervalMinutes: number;
-  recurrenceType: string;
-}
-
-export class UpdateCampaignDto {
-  name?: string;
-}
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateCampaignDto, UpdateCampaignDto } from './dto/create-campaign.dto';
 
 @Injectable()
 export class CampaignsService {
   constructor(
-    private readonly prisma: PrismaService,
-    @InjectQueue('message-queue') private readonly messageQueue: Queue,
+    private prisma: PrismaService,
+    @InjectQueue('message-queue') private messageQueue: Queue,
   ) {}
 
   async create(userId: string, dto: CreateCampaignDto) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      include: {
-        instances: true,
-        subscription: {
-          include: { plan: true },
-        },
-      },
+    // Validate instance belongs to user
+    const instance = await this.prisma.whatsAppInstance.findFirst({
+      where: { id: dto.instanceId, userId },
     });
+    if (!instance) throw new BadRequestException('Instância não encontrada');
+    if (instance.status !== 'CONNECTED') throw new BadRequestException('WhatsApp não está conectado');
 
-    if (!user) throw new NotFoundException('User not found');
-
-    const connectedInstance = user.instances.find(i => i.status === 'CONNECTED');
-    if (!connectedInstance) {
-      throw new BadRequestException('No connected WhatsApp instance found.');
-    }
-
-    const subscription = user.subscription;
-    if (!subscription || !['ACTIVE', 'TRIAL'].includes(subscription.status) || (subscription.endsAt && subscription.endsAt < new Date())) {
-      throw new BadRequestException('No active subscription found.');
+    // Validate subscription
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: { in: ['ACTIVE', 'TRIAL'] } },
+      include: { plan: true },
+    });
+    if (!subscription) throw new BadRequestException('Assinatura inativa ou expirada');
+    if (subscription.endsAt && subscription.endsAt < new Date()) {
+      throw new BadRequestException('Assinatura expirada');
     }
 
     const plan = subscription.plan;
-    
+
+    // Check groups limit
+    if (dto.groupIds.length > plan.maxGroups) {
+      throw new BadRequestException(`Seu plano permite no máximo ${plan.maxGroups} grupos por campanha`);
+    }
+
+    // Check campaigns limit
+    const activeCampaigns = await this.prisma.campaign.count({ where: { userId, status: 'ACTIVE' } });
+    if (activeCampaigns >= plan.maxCampaigns) {
+      throw new BadRequestException(`Limite de ${plan.maxCampaigns} campanhas ativas atingido`);
+    }
+
+    // Check daily usage
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const dailyUsage = await this.prisma.dailyUsage.findFirst({
-      where: { userId, date: today },
-    });
-    const currentMessagesCount = dailyUsage?.messagesCount || 0;
-    if (currentMessagesCount + dto.groupIds.length > plan.maxMessagesPerDay) {
-      throw new BadRequestException('Daily message limit would be exceeded.');
+    const usage = await this.prisma.dailyUsage.findFirst({ where: { userId, date: { gte: today } } });
+    const currentUsage = usage?.messagesCount || 0;
+    if (currentUsage + dto.groupIds.length > plan.maxMessagesPerDay) {
+      throw new BadRequestException(`Limite diário de ${plan.maxMessagesPerDay} mensagens seria excedido`);
     }
 
-    const activeCampaigns = await this.prisma.campaign.count({
-      where: { userId, status: 'ACTIVE' },
-    });
-    if (activeCampaigns >= plan.maxCampaigns) {
-      throw new BadRequestException('Max active campaigns reached for this plan.');
-    }
-
-    if (dto.groupIds.length > plan.maxGroups) {
-      throw new BadRequestException('Max groups per campaign exceeded for this plan.');
-    }
-
-    const groups = await this.prisma.group.findMany({
-      where: { id: { in: dto.groupIds }, instanceId: connectedInstance.id },
-    });
-
-    if (groups.length === 0) {
-      throw new BadRequestException('No valid groups selected.');
-    }
-
-    const nextRunAt = this.calculateNextRun(dto.recurrenceType, dto.scheduledAt);
-
+    // Create campaign
+    const scheduledAt = new Date(dto.scheduledAt);
     const campaign = await this.prisma.campaign.create({
       data: {
         userId,
+        instanceId: dto.instanceId,
         name: dto.name,
         message: dto.message,
-        mediaType: dto.mediaType || 'TEXT',
         mediaUrl: dto.mediaUrl,
-        recurrenceType: dto.recurrenceType || 'ONCE',
-        status: 'ACTIVE',
-        scheduledAt: new Date(dto.scheduledAt),
-        intervalMinutes: dto.intervalMinutes || 0,
-        nextRunAt,
+        mediaType: (dto.mediaType || 'TEXT') as any,
+        recurrenceType: dto.recurrenceType as any,
+        recurrenceDays: dto.recurrenceDays as any,
+        recurrenceDay: dto.recurrenceDay,
+        timezone: dto.timezone || 'America/Sao_Paulo',
+        scheduledAt,
+        intervalMinutes: dto.intervalMinutes || 1,
+        status: 'ACTIVE' as any,
+        nextRunAt: scheduledAt,
       },
     });
 
-    const campaignGroupsData = groups.map((group, index) => {
-      const scheduledTime = new Date(new Date(dto.scheduledAt).getTime() + index * (dto.intervalMinutes || 0) * 60000);
-      return {
-        campaignId: campaign.id,
-        groupId: group.id,
-        status: 'PENDING',
-        scheduledAt: scheduledTime,
-      };
+    // Validate groups exist
+    const groups = await this.prisma.group.findMany({
+      where: { id: { in: dto.groupIds }, isAvailable: true },
     });
 
-    await this.prisma.campaignGroup.createMany({
-      data: campaignGroupsData,
-    });
+    // Create CampaignGroup records with staggered times
+    const intervalMs = (dto.intervalMinutes || 1) * 60 * 1000;
+    const campaignGroupsData = groups.map((group, index) => ({
+      campaignId: campaign.id,
+      groupId: group.id,
+      orderIndex: index,
+      status: 'PENDING' as any,
+      scheduledAt: new Date(scheduledAt.getTime() + index * intervalMs),
+    }));
 
-    const campaignGroups = await this.prisma.campaignGroup.findMany({
+    await this.prisma.campaignGroup.createMany({ data: campaignGroupsData });
+
+    // Schedule BullMQ jobs
+    const createdGroups = await this.prisma.campaignGroup.findMany({
       where: { campaignId: campaign.id },
+      orderBy: { orderIndex: 'asc' },
     });
 
-    const now = new Date();
-    for (const cg of campaignGroups) {
-      let delay = new Date(cg.scheduledAt).getTime() - now.getTime();
-      if (delay < 0) delay = 0;
-      
-      const job = await this.messageQueue.add(
-        { campaignGroupId: cg.id },
-        { delay }
-      );
-
-      await this.prisma.campaignGroup.update({
-        where: { id: cg.id },
-        data: { jobId: job.id.toString() },
-      });
+    const now = Date.now();
+    for (const cg of createdGroups) {
+      const delay = Math.max(0, cg.scheduledAt.getTime() - now);
+      await this.messageQueue.add({ campaignGroupId: cg.id }, { delay, attempts: 3 });
     }
 
-    return await this.prisma.campaign.findUnique({
+    return this.prisma.campaign.findUnique({
       where: { id: campaign.id },
-      include: { campaignGroups: true },
+      include: { campaignGroup: { orderBy: { orderIndex: 'asc' } } },
     });
   }
 
   async findAll(userId: string, status?: string, page = 1, limit = 20) {
-    const skip = (page - 1) * limit;
-    const whereClause: any = { userId };
-    if (status) whereClause.status = status;
+    const skip = (Number(page) - 1) * Number(limit);
+    const where: any = { userId };
+    if (status) where.status = status;
 
-    const [data, total] = await Promise.all([
+    const [campaigns, total] = await Promise.all([
       this.prisma.campaign.findMany({
-        where: whereClause,
+        where,
+        include: { _count: { select: { campaignGroup: true } } },
         skip,
-        take: +limit,
-        include: { _count: { select: { campaignGroups: true } } },
+        take: Number(limit),
         orderBy: { createdAt: 'desc' },
       }),
-      this.prisma.campaign.count({ where: whereClause }),
+      this.prisma.campaign.count({ where }),
     ]);
 
-    return { data, total, page, limit };
+    return { campaigns, total, page: Number(page), limit: Number(limit) };
   }
 
   async findOne(userId: string, id: string) {
     const campaign = await this.prisma.campaign.findFirst({
       where: { id, userId },
       include: {
-        campaignGroups: {
+        campaignGroup: {
           include: { group: true },
+          orderBy: { orderIndex: 'asc' },
         },
-        groups: true,
       },
     });
-    if (!campaign) throw new NotFoundException('Campaign not found');
+    if (!campaign) throw new NotFoundException('Campanha não encontrada');
     return campaign;
   }
 
-  async update(userId: string, id: string, dto: UpdateCampaignDto) {
-    const campaign = await this.findOne(userId, id);
-    return this.prisma.campaign.update({
-      where: { id: campaign.id },
-      data: { name: dto.name },
-    });
-  }
-
   async pause(userId: string, id: string) {
-    const campaign = await this.findOne(userId, id);
+    const campaign = await this.prisma.campaign.findFirst({ where: { id, userId } });
+    if (!campaign) throw new NotFoundException('Campanha não encontrada');
     
-    const pendingGroups = campaign.campaignGroups.filter(cg => cg.status === 'PENDING' && cg.jobId);
-    for (const cg of pendingGroups) {
-      if (cg.jobId) {
-        const job = await this.messageQueue.getJob(cg.jobId);
-        if (job) await job.remove();
-      }
-      await this.prisma.campaignGroup.update({
-        where: { id: cg.id },
-        data: { jobId: null },
-      });
-    }
-
-    return this.prisma.campaign.update({
-      where: { id },
-      data: { status: 'PAUSED' },
-    });
+    await this.prisma.campaign.update({ where: { id }, data: { status: 'PAUSED' as any } });
+    return { message: 'Campanha pausada com sucesso' };
   }
 
   async resume(userId: string, id: string) {
-    const campaign = await this.findOne(userId, id);
-    
-    const updatedCampaign = await this.prisma.campaign.update({
-      where: { id },
-      data: { status: 'ACTIVE' },
+    const campaign = await this.prisma.campaign.findFirst({ where: { id, userId } });
+    if (!campaign) throw new NotFoundException('Campanha não encontrada');
+
+    // Reschedule pending groups
+    const pendingGroups = await this.prisma.campaignGroup.findMany({
+      where: { campaignId: id, status: 'PENDING' },
+      orderBy: { orderIndex: 'asc' },
     });
 
-    const pendingGroups = campaign.campaignGroups.filter(cg => cg.status === 'PENDING');
-    const now = new Date();
-
-    for (const cg of pendingGroups) {
-      let delay = new Date(cg.scheduledAt).getTime() - now.getTime();
-      if (delay < 0) delay = 0;
-      
-      const job = await this.messageQueue.add(
-        { campaignGroupId: cg.id },
-        { delay }
-      );
-
-      await this.prisma.campaignGroup.update({
-        where: { id: cg.id },
-        data: { jobId: job.id.toString() },
-      });
+    const now = Date.now();
+    const intervalMs = campaign.intervalMinutes * 60 * 1000;
+    for (let i = 0; i < pendingGroups.length; i++) {
+      const delay = i * intervalMs;
+      await this.messageQueue.add({ campaignGroupId: pendingGroups[i].id }, { delay, attempts: 3 });
     }
 
-    return updatedCampaign;
+    await this.prisma.campaign.update({ where: { id }, data: { status: 'ACTIVE' as any } });
+    return { message: 'Campanha retomada com sucesso' };
   }
 
   async remove(userId: string, id: string) {
-    const campaign = await this.findOne(userId, id);
-    
-    for (const cg of campaign.campaignGroups) {
-      if (cg.jobId) {
-        const job = await this.messageQueue.getJob(cg.jobId);
-        if (job) await job.remove();
-      }
-    }
-
-    await this.prisma.campaignGroup.deleteMany({ where: { campaignId: id } });
-    return this.prisma.campaign.delete({ where: { id } });
-  }
-
-  private calculateNextRun(recurrenceType: string, scheduledAt: Date | string): Date | null {
-    if (!recurrenceType || recurrenceType === 'ONCE') return null;
-    const next = new Date(scheduledAt);
-    if (recurrenceType === 'DAILY') {
-      next.setDate(next.getDate() + 1);
-    } else if (recurrenceType === 'WEEKLY') {
-      next.setDate(next.getDate() + 7);
-    } else if (recurrenceType === 'MONTHLY') {
-      next.setMonth(next.getMonth() + 1);
-    }
-    return next;
+    const campaign = await this.prisma.campaign.findFirst({ where: { id, userId } });
+    if (!campaign) throw new NotFoundException('Campanha não encontrada');
+    await this.prisma.campaign.delete({ where: { id } });
+    return { message: 'Campanha removida com sucesso' };
   }
 }

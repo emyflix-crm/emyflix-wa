@@ -1,205 +1,174 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
 export class AdminService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private prisma: PrismaService) {}
 
   async getDashboardStats() {
-    const totalUsers = await this.prisma.user.count({
-      where: { role: 'USER' },
-    });
-
-    const activeUsers = await this.prisma.user.count({
-      where: { role: 'USER', subscription: { status: 'ACTIVE' } },
-    });
-
-    const trialUsers = await this.prisma.user.count({
-      where: { role: 'USER', subscription: { status: 'TRIAL' } },
-    });
-
-    const expiredUsers = await this.prisma.user.count({
-      where: { role: 'USER', subscription: { status: { in: ['EXPIRED', 'CANCELLED'] } } },
-    });
-
-    const totalMessagesSent = await this.prisma.messageHistory.count({
-      where: { status: 'SENT' },
-    });
-
-    const connectedInstances = await this.prisma.whatsAppInstance.count({
-      where: { status: 'CONNECTED' },
-    });
-
+    const totalUsers = await this.prisma.user.count({ where: { role: 'USER' } });
+    
+    const activeSubscriptions = await this.prisma.subscription.count({ where: { status: 'ACTIVE' } });
+    const trialSubscriptions = await this.prisma.subscription.count({ where: { status: 'TRIAL' } });
+    const expiredSubscriptions = await this.prisma.subscription.count({ where: { status: { in: ['EXPIRED', 'CANCELLED'] } } });
+    
+    const totalMessagesSent = await this.prisma.messageHistory.count({ where: { status: 'SENT' } });
+    const connectedInstances = await this.prisma.whatsAppInstance.count({ where: { status: 'CONNECTED' } });
+    
     const now = new Date();
-    const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    
+    const newUsersThisMonth = await this.prisma.user.count({
+      where: { role: 'USER', createdAt: { gte: startOfMonth } },
+    });
 
-    const activeSubscriptions = await this.prisma.subscription.findMany({
+    const activeSubscriptionList = await this.prisma.subscription.findMany({
       where: { status: 'ACTIVE' },
       include: { plan: true },
     });
-
-    const monthlyRevenue = activeSubscriptions.reduce((acc, sub) => {
-      // Simplification assuming monthly billing
-      return acc + (sub.plan?.price || 0);
+    
+    const monthlyRevenue = activeSubscriptionList.reduce((acc, sub) => {
+      return acc + Number(sub.plan?.price || 0);
     }, 0);
-
-    const newUsersThisMonth = await this.prisma.user.count({
-      where: {
-        role: 'USER',
-        createdAt: { gte: firstDayOfMonth },
-      },
-    });
 
     return {
       totalUsers,
-      activeUsers,
-      trialUsers,
-      expiredUsers,
+      activeUsers: activeSubscriptions,
+      trialUsers: trialSubscriptions,
+      expiredUsers: expiredSubscriptions,
       totalMessagesSent,
       connectedInstances,
       monthlyRevenue,
+      yearlyRevenue: monthlyRevenue * 12,
       newUsersThisMonth,
     };
   }
 
-  async getUsers(filters: { search?: string; status?: string; planId?: string; page?: number; limit?: number }) {
-    const page = filters.page ? +filters.page : 1;
-    const limit = filters.limit ? +filters.limit : 20;
+  async getUsers(filters: any = {}) {
+    const { search, status, planId, page = 1, limit = 20 } = filters;
     const skip = (page - 1) * limit;
 
     const where: any = { role: 'USER' };
-
-    if (filters.search) {
+    if (search) {
       where.OR = [
-        { name: { contains: filters.search, mode: 'insensitive' } },
-        { email: { contains: filters.search, mode: 'insensitive' } },
+        { name: { contains: search, mode: 'insensitive' } },
+        { email: { contains: search, mode: 'insensitive' } },
       ];
     }
 
-    if (filters.status) {
-      if (filters.status === 'BLOCKED') {
-        where.status = 'BLOCKED';
-      } else {
-        where.subscription = { status: filters.status };
-      }
-    }
-
-    if (filters.planId) {
-      where.subscription = { ...where.subscription, planId: filters.planId };
-    }
-
-    const [data, total] = await Promise.all([
+    const [users, total] = await Promise.all([
       this.prisma.user.findMany({
         where,
-        skip,
-        take: limit,
         include: {
-          subscription: { include: { plan: true } },
+          subscriptions: {
+            include: { plan: true },
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+          },
         },
+        skip: Number(skip),
+        take: Number(limit),
         orderBy: { createdAt: 'desc' },
       }),
       this.prisma.user.count({ where }),
     ]);
 
-    return { data, total, page, limit };
+    return { users, total, page: Number(page), limit: Number(limit) };
   }
 
   async getUserDetail(userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
-        subscription: { include: { plan: true } },
-        instances: true,
+        subscriptions: { include: { plan: true }, orderBy: { createdAt: 'desc' }, take: 1 },
+        whatsAppInstances: true,
       },
     });
 
-    if (!user) throw new NotFoundException('User not found');
-
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-
-    const usage = await this.prisma.dailyUsage.findFirst({
-      where: { userId, date: today },
+    const dailyUsage = await this.prisma.dailyUsage.findFirst({
+      where: { userId, date: { gte: today } },
     });
 
-    const campaignCount = await this.prisma.campaign.count({
-      where: { userId },
-    });
+    const campaignCount = await this.prisma.campaign.count({ where: { userId, status: 'ACTIVE' } });
 
-    return {
-      ...user,
-      todayUsage: usage?.messagesCount || 0,
-      campaignCount,
-    };
+    return { ...user, dailyUsage, campaignCount };
   }
 
-  async updateUser(userId: string, dto: { name?: string; email?: string; status?: string }) {
+  async updateUser(userId: string, dto: any) {
     return this.prisma.user.update({
       where: { id: userId },
-      data: dto,
+      data: {
+        ...(dto.name && { name: dto.name }),
+        ...(dto.email && { email: dto.email }),
+        ...(dto.status && { status: dto.status as any }),
+      },
     });
   }
 
   async blockUser(userId: string) {
-    return this.prisma.user.update({
-      where: { id: userId },
-      data: { status: 'BLOCKED' },
-    });
+    return this.prisma.user.update({ where: { id: userId }, data: { status: 'BLOCKED' as any } });
   }
 
   async unblockUser(userId: string) {
-    return this.prisma.user.update({
-      where: { id: userId },
-      data: { status: 'ACTIVE' },
-    });
+    return this.prisma.user.update({ where: { id: userId }, data: { status: 'ACTIVE' as any } });
   }
 
   async deleteUser(userId: string) {
-    return this.prisma.user.delete({
-      where: { id: userId },
-    });
+    return this.prisma.user.delete({ where: { id: userId } });
   }
 
   async activateTrial(userId: string, days: number) {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) throw new NotFoundException('User not found');
-
     const trialEndsAt = new Date();
     trialEndsAt.setDate(trialEndsAt.getDate() + days);
 
     await this.prisma.user.update({
       where: { id: userId },
-      data: { isTrialActive: true, trialEndsAt },
+      data: { trialEndsAt, isTrialActive: true },
     });
 
-    const defaultPlan = await this.prisma.plan.findFirst();
+    const firstPlan = await this.prisma.plan.findFirst({ where: { isActive: true }, orderBy: { sortOrder: 'asc' } });
+    
+    if (firstPlan) {
+      const existing = await this.prisma.subscription.findFirst({ where: { userId } });
+      if (existing) {
+        await this.prisma.subscription.update({
+          where: { id: existing.id },
+          data: { status: 'TRIAL' as any, endsAt: trialEndsAt, planId: firstPlan.id },
+        });
+      } else {
+        await this.prisma.subscription.create({
+          data: {
+            userId,
+            planId: firstPlan.id,
+            status: 'TRIAL' as any,
+            billingCycle: 'MONTHLY' as any,
+            startsAt: new Date(),
+            endsAt: trialEndsAt,
+          },
+        });
+      }
+    }
 
-    return this.prisma.subscription.upsert({
-      where: { userId },
-      create: {
-        userId,
-        planId: defaultPlan?.id || '',
-        status: 'TRIAL',
-        billingCycle: 'MONTHLY',
-        startsAt: new Date(),
-        endsAt: trialEndsAt,
-      },
-      update: {
-        status: 'TRIAL',
-        endsAt: trialEndsAt,
-      },
-    });
+    return { message: `Trial de ${days} dias ativado com sucesso` };
   }
 
   async changePlan(userId: string, planId: string) {
-    const plan = await this.prisma.plan.findUnique({ where: { id: planId } });
-    if (!plan) throw new NotFoundException('Plan not found');
-
-    return this.prisma.subscription.update({
-      where: { userId },
+    const existing = await this.prisma.subscription.findFirst({ where: { userId } });
+    if (existing) {
+      return this.prisma.subscription.update({
+        where: { id: existing.id },
+        data: { planId, status: 'ACTIVE' as any },
+      });
+    }
+    return this.prisma.subscription.create({
       data: {
-        planId,
-        status: 'ACTIVE',
+        userId, planId,
+        status: 'ACTIVE' as any,
+        billingCycle: 'MONTHLY' as any,
+        startsAt: new Date(),
+        endsAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       },
     });
   }

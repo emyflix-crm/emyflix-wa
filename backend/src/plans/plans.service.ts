@@ -1,13 +1,12 @@
-import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { CreatePlanDto } from './dto/create-plan.dto';
-import dayjs from 'dayjs';
+import { CreatePlanDto, UpdatePlanDto } from './dto/create-plan.dto';
 
 @Injectable()
 export class PlansService {
   constructor(private prisma: PrismaService) {}
 
-  async findAll(onlyActive: boolean = true) {
+  async findAll(onlyActive = true) {
     return this.prisma.plan.findMany({
       where: onlyActive ? { isActive: true } : {},
       orderBy: { sortOrder: 'asc' },
@@ -16,27 +15,31 @@ export class PlansService {
 
   async findById(id: string) {
     const plan = await this.prisma.plan.findUnique({ where: { id } });
-    if (!plan) throw new NotFoundException('Plan not found');
+    if (!plan) throw new NotFoundException('Plano não encontrado');
     return plan;
   }
 
   async create(dto: CreatePlanDto) {
-    const existing = await this.prisma.plan.findUnique({ where: { slug: dto.slug } });
-    if (existing) throw new BadRequestException('Plan with this slug already exists');
-
     return this.prisma.plan.create({
       data: {
-        ...dto,
+        name: dto.name,
+        slug: dto.slug,
+        description: dto.description,
+        price: dto.price,
+        maxMessagesPerDay: dto.maxMessagesPerDay,
+        maxGroups: dto.maxGroups,
+        maxCampaigns: dto.maxCampaigns,
+        maxInstances: dto.maxInstances,
+        features: dto.features,
+        isActive: dto.isActive !== undefined ? dto.isActive : true,
+        sortOrder: dto.sortOrder || 0,
       },
     });
   }
 
-  async update(id: string, dto: Partial<CreatePlanDto>) {
+  async update(id: string, dto: UpdatePlanDto) {
     await this.findById(id);
-    return this.prisma.plan.update({
-      where: { id },
-      data: dto,
-    });
+    return this.prisma.plan.update({ where: { id }, data: dto as any });
   }
 
   async delete(id: string) {
@@ -44,50 +47,33 @@ export class PlansService {
     return this.prisma.plan.delete({ where: { id } });
   }
 
-  async checkUserLimit(userId: string, limitType: 'messages' | 'groups' | 'campaigns' | 'instances') {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      include: {
-        subscriptions: {
-          where: { status: { in: ['ACTIVE', 'TRIAL'] } },
-          include: { plan: true },
-          orderBy: { startsAt: 'desc' },
-          take: 1,
-        }
-      }
+  async checkUserLimit(userId: string, limitType: string) {
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: { in: ['ACTIVE', 'TRIAL'] } },
+      include: { plan: true },
     });
+    if (!subscription) return { allowed: false, reason: 'Sem assinatura ativa' };
 
-    if (!user || user.subscriptions.length === 0) {
-      throw new BadRequestException('No active subscription found');
+    const plan = subscription.plan;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    if (limitType === 'messages') {
+      const usage = await this.prisma.dailyUsage.findFirst({ where: { userId, date: { gte: today } } });
+      const used = usage?.messagesCount || 0;
+      return { allowed: used < plan.maxMessagesPerDay, used, limit: plan.maxMessagesPerDay };
     }
 
-    const plan = user.subscriptions[0].plan;
-
-    switch (limitType) {
-      case 'messages':
-        const today = dayjs().startOf('day').toDate();
-        const usage = await this.prisma.dailyUsage.findUnique({
-          where: { userId_date: { userId, date: today } }
-        });
-        if (usage && usage.messagesCount >= plan.maxMessagesPerDay) {
-          throw new BadRequestException('Daily message limit exceeded');
-        }
-        return true;
-      case 'groups':
-        // Implement group count check if needed
-        return true;
-      case 'campaigns':
-        const campaigns = await this.prisma.campaign.count({ where: { userId, status: 'ACTIVE' } });
-        if (campaigns >= plan.maxCampaigns) {
-          throw new BadRequestException('Active campaigns limit exceeded');
-        }
-        return true;
-      case 'instances':
-        const instances = await this.prisma.whatsappInstance.count({ where: { userId } });
-        if (instances >= plan.maxInstances) {
-          throw new BadRequestException('WhatsApp instances limit exceeded');
-        }
-        return true;
+    if (limitType === 'campaigns') {
+      const count = await this.prisma.campaign.count({ where: { userId, status: 'ACTIVE' } });
+      return { allowed: count < plan.maxCampaigns, used: count, limit: plan.maxCampaigns };
     }
+
+    if (limitType === 'instances') {
+      const count = await this.prisma.whatsAppInstance.count({ where: { userId } });
+      return { allowed: count < plan.maxInstances, used: count, limit: plan.maxInstances };
+    }
+
+    return { allowed: true };
   }
 }

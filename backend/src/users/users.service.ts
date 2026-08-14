@@ -1,7 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import * as bcrypt from 'bcryptjs';
-import dayjs from 'dayjs';
 
 @Injectable()
 export class UsersService {
@@ -11,10 +10,7 @@ export class UsersService {
     return this.prisma.user.findUnique({
       where: { id },
       include: {
-        subscriptions: {
-          where: { status: { in: ['ACTIVE', 'TRIAL'] } },
-          include: { plan: true },
-        },
+        subscriptions: { include: { plan: true }, orderBy: { createdAt: 'desc' }, take: 1 },
       },
     });
   }
@@ -27,80 +23,57 @@ export class UsersService {
     if (dto.email) {
       const existing = await this.prisma.user.findUnique({ where: { email: dto.email } });
       if (existing && existing.id !== userId) {
-        throw new BadRequestException('Email already in use');
+        throw new BadRequestException('Este email já está em uso');
       }
     }
-
     return this.prisma.user.update({
       where: { id: userId },
-      data: {
-        name: dto.name,
-        email: dto.email,
-      },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-      }
+      data: { ...(dto.name && { name: dto.name }), ...(dto.email && { email: dto.email }) },
     });
   }
 
   async changePassword(userId: string, currentPassword: string, newPassword: string) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) throw new BadRequestException('User not found');
-
     const isValid = await bcrypt.compare(currentPassword, user.passwordHash);
-    if (!isValid) throw new BadRequestException('Invalid current password');
-
-    const passwordHash = await bcrypt.hash(newPassword, 10);
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { passwordHash },
-    });
-
-    return { message: 'Password updated successfully' };
+    if (!isValid) throw new BadRequestException('Senha atual incorreta');
+    const hash = await bcrypt.hash(newPassword, 12);
+    await this.prisma.user.update({ where: { id: userId }, data: { passwordHash: hash } });
+    return { message: 'Senha alterada com sucesso' };
   }
 
   async getTrialInfo(userId: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { trialEndsAt: true, isTrialActive: true }
-    });
-
-    if (!user) throw new BadRequestException('User not found');
-
-    let daysLeft = 0;
-    if (user.trialEndsAt && user.isTrialActive) {
-      daysLeft = dayjs(user.trialEndsAt).diff(dayjs(), 'day');
-      if (daysLeft < 0) daysLeft = 0;
-    }
-
-    return {
-      isTrialActive: user.isTrialActive && daysLeft > 0,
-      trialEndsAt: user.trialEndsAt,
-      daysLeft,
-    };
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const now = new Date();
+    const daysLeft = user.trialEndsAt
+      ? Math.max(0, Math.ceil((user.trialEndsAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)))
+      : 0;
+    return { trialEndsAt: user.trialEndsAt, daysLeft, isTrialActive: user.isTrialActive };
   }
 
   async getUserStats(userId: string) {
-    const today = dayjs().startOf('day').toDate();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    const [dailyUsage, campaignsCount, instancesCount] = await Promise.all([
-      this.prisma.dailyUsage.findUnique({
-        where: { userId_date: { userId, date: today } }
-      }),
-      this.prisma.campaign.count({
-        where: { userId, status: 'ACTIVE' }
-      }),
-      this.prisma.whatsappInstance.count({
-        where: { userId, status: 'CONNECTED' }
-      })
+    const [messagesSentToday, activeCampaigns, connectedInstances] = await Promise.all([
+      this.prisma.messageHistory.count({ where: { userId, sentAt: { gte: today }, status: 'SENT' } }),
+      this.prisma.campaign.count({ where: { userId, status: 'ACTIVE' } }),
+      this.prisma.whatsAppInstance.count({ where: { userId, status: 'CONNECTED' } }),
     ]);
 
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: { in: ['ACTIVE', 'TRIAL'] } },
+      include: { plan: true },
+    });
+
+    const dailyUsage = await this.prisma.dailyUsage.findFirst({ where: { userId, date: { gte: today } } });
+
     return {
-      messagesToday: dailyUsage?.messagesCount || 0,
-      activeCampaigns: campaignsCount,
-      connectedInstances: instancesCount,
+      messagesSentToday,
+      activeCampaigns,
+      connectedInstances,
+      dailyLimit: subscription?.plan?.maxMessagesPerDay || 0,
+      dailyUsed: dailyUsage?.messagesCount || 0,
+      plan: subscription?.plan?.name || 'Sem plano',
     };
   }
 }

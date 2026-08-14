@@ -46,43 +46,54 @@ export class AuthService {
     });
 
     return {
-      access_token: accessToken,
-      refresh_token: refreshTokenValue,
+      accessToken,
+      refreshToken: refreshTokenValue,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+      },
     };
   }
 
   async register(dto: RegisterDto) {
-    if (!dto.acceptTerms) {
-      throw new BadRequestException('You must accept the terms');
-    }
-    
-    if (dto.password !== dto.confirmPassword) {
-      throw new BadRequestException('Passwords do not match');
-    }
-
     const existingUser = await this.prisma.user.findUnique({ where: { email: dto.email } });
     if (existingUser) {
-      throw new BadRequestException('Email already in use');
+      throw new BadRequestException('Email já está em uso');
     }
 
     const passwordHash = await bcrypt.hash(dto.password, 10);
-    const emailVerificationToken = uuidv4();
+    const trialEndsAt = dayjs().add(7, 'day').toDate();
+    const firstPlan = await this.prisma.plan.findFirst({ orderBy: { sortOrder: 'asc' } });
 
     const user = await this.prisma.user.create({
       data: {
         name: dto.name,
         email: dto.email,
         passwordHash,
-        emailVerificationToken,
-        emailVerificationExpires: dayjs().add(24, 'hour').toDate(),
-        status: 'PENDING',
+        emailVerified: true,
+        status: 'ACTIVE',
+        trialEndsAt,
+        isTrialActive: true,
       },
     });
 
-    const baseUrl = this.configService.get('FRONTEND_URL');
-    await this.emailService.sendVerificationEmail(user.email, user.name, emailVerificationToken, baseUrl);
+    if (firstPlan) {
+      await this.prisma.subscription.create({
+        data: {
+          userId: user.id,
+          planId: firstPlan.id,
+          status: 'TRIAL',
+          billingCycle: 'MONTHLY',
+          startsAt: new Date(),
+          endsAt: trialEndsAt,
+        },
+      });
+    }
 
-    return { message: 'Registration successful. Please check your email to verify your account.' };
+    return { message: 'Cadastro realizado com sucesso!' };
   }
 
   async logout(userId: string, token: string) {
